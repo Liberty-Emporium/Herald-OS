@@ -104,5 +104,8 @@ pamu2fcfg
 # Rescue terminal, and a browser, files and an editor for the Dock and system_open.
 foot
 firefox
+# Chromium is what Hermes' browser tools drive over CDP (browser.headed + browser.cdp_url);
+# Firefox alone cannot be driven that way, so a Herald OS without it has no agent browser.
+chromium
 nautilus
 gnome-text-editor

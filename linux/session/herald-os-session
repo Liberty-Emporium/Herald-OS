@@ -28,6 +28,12 @@ dbus-update-activation-environment --systemd "${SESSION_VARS[@]}" 2>/dev/null ||
 systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber.service 2>/dev/null || true
 systemctl --user start xdg-desktop-portal.service 2>/dev/null || true
 
+# The shared browser: a visible Chromium on the loopback debug port Hermes' browser tools are
+# pointed at (browser.headed + browser.cdp_url), so the agent drives the same tabs the person sees.
+if command -v herald-os-browser >/dev/null 2>&1; then
+  herald-os-browser start >>"$LOG_DIR/browser.log" 2>&1 || true
+fi
+
 # System services that belong to the session (panels mode only; cage has no room for them):
 # clipboard history, idle lock and display power, all as transient user units so they die with us.
 if [[ "$HERALD_OS_SHELL_MODE" == "panels" ]]; then

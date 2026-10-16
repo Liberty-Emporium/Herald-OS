@@ -1,6 +1,7 @@
 # Herald OS omakase: Fedora packages every install gets. One per line; # comments.
-# Browsers, files, text.
+# Browsers, files, text. Chromium is the one Hermes' browser tools drive over CDP.
 firefox
+chromium
 nautilus
 gnome-text-editor
 # Documents and media.

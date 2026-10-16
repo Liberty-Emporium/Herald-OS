@@ -2804,6 +2804,9 @@ def hermes_command() -> list[str] | None:
 
 
 TOOL_SEARCH = "tools.tool_search.enabled"
+# The shared browser (herald-os-browser) binds this loopback port; browser.cdp_url points Hermes'
+# browser tools at it, so people and agents drive the same visible Chromium.
+BROWSER_CDP_URL = "http://127.0.0.1:9222"
 # `hermes tools enable` reports an unknown toolset as a ✗ line and still exits 0.
 HERMES_ERROR = re.compile(r"^\s*✗", re.M)
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -2847,6 +2850,8 @@ def enable_bridge(hermes: list[str]) -> None:
     Search would hide plugin tools behind a lookup, and it has no per-plugin switch (ADR-010)."""
     hermes_step(hermes, ["plugins", "enable", "herald-os-bridge"], f"adds it to plugins.enabled in {HERMES_HOME / 'config.yaml'}")
     hermes_step(hermes, ["tools", "enable", "herald_os"], "saves platform_toolsets.cli with herald_os in it (Herald OS's sessions share that list with the hermes CLI; the tools run only in Herald OS sessions)")
+    hermes_step(hermes, ["config", "set", "browser.headed", "true"], "makes the agent's browser a visible window instead of a hidden one")
+    hermes_step(hermes, ["config", "set", "browser.cdp_url", BROWSER_CDP_URL], f"points Hermes' browser tools at the shared browser on {BROWSER_CDP_URL} (herald-os-browser start)")
     before, record = hermes_value(hermes, TOOL_SEARCH), tool_search_before()
     if before == "off":
         print(f"==> {TOOL_SEARCH} is off already")
@@ -2865,6 +2870,8 @@ def setup_undo() -> int:
         # Hermes knows the toolset only while the plugin is linked and enabled, so it goes first.
         hermes_step(hermes, ["tools", "disable", "herald_os"], "takes herald_os out of platform_toolsets.cli", gone="Unknown toolset")
         hermes_step(hermes, ["plugins", "disable", "herald-os-bridge"], "moves it from plugins.enabled to plugins.disabled", gone="No plugin named")
+        hermes_step(hermes, ["config", "set", "browser.cdp_url", ""], "so Hermes launches its own browser instead of the shared one")
+        hermes_step(hermes, ["config", "set", "browser.headed", "false"], "back to Hermes' default (a hidden agent browser)")
         restore_tool_search(hermes)
     else:
         print("Hermes Agent is not installed, so only the plugin link is removed.")

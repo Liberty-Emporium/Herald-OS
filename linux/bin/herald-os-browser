@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# The browser people and agents share. Hermes' browser tools speak the Chrome DevTools Protocol
+# and only to a Chromium-family browser, so Herald OS ships Chromium and keeps one running on the
+# loopback debug port Hermes is pointed at (browser.headed + browser.cdp_url). The window is
+# visible: open a tab here and the agent can read it; let the agent open one and you can watch or
+# take over. The profile is Hermes' own (~/.hermes/chrome-debug), never the person's browser.
+#
+#   herald-os-browser start | stop | status | url
+set -euo pipefail
+
+PORT="${HERALD_OS_BROWSER_DEBUG_PORT:-9222}"
+PROFILE_DIR="${HERMES_HOME:-$HOME/.hermes}/chrome-debug"
+URL="${HERALD_OS_BROWSER_URL:-http://127.0.0.1:$PORT}"
+
+ready() { curl -fsS "$URL/json/version" >/dev/null 2>&1; }
+
+pick_browser() {
+  local b
+  for b in chromium chromium-browser brave-browser brave google-chrome google-chrome-stable microsoft-edge; do
+    command -v "$b" >/dev/null 2>&1 && { echo "$b"; return 0; }
+  done
+  return 1
+}
+
+start() {
+  if ready; then echo "already up: $URL"; return 0; fi
+  local bin
+  bin="$(pick_browser)" || { echo "no Chromium-family browser is installed (install chromium)" >&2; return 127; }
+  mkdir -p "$PROFILE_DIR"
+  echo "starting $bin on $URL (profile $PROFILE_DIR)"
+  setsid "$bin" --remote-debugging-port="$PORT" --user-data-dir="$PROFILE_DIR" \
+    --no-first-run --no-default-browser-check about:blank >/dev/null 2>&1 &
+  local _
+  for _ in $(seq 1 50); do
+    ready && { echo "ready: $URL"; return 0; }
+    sleep 0.1
+  done
+  echo "started, but $URL is not answering yet" >&2
+  return 1
+}
+
+stop() {
+  if pkill -f -- "--user-data-dir=$PROFILE_DIR"; then echo "stopped"; else echo "not running"; fi
+}
+
+status() { if ready; then echo "up: $URL"; else echo "down: $URL"; fi; }
+
+case "${1:-start}" in
+  start) start ;;
+  stop) stop ;;
+  status) status ;;
+  url) echo "$URL" ;;
+  *) echo "usage: herald-os-browser start|stop|status|url" >&2; exit 2 ;;
+esac
