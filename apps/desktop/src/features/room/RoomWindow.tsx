@@ -1,19 +1,20 @@
 import type { ApprovalChoice } from '@herald-os/client'
 import { useStore } from '@nanostores/react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { petShown } from '../../../shared/pet.ts'
+import { liveOutside } from '../../../shared/room.ts'
 import { $connection } from '../../store/gateway.ts'
 import { runCommand } from '../../store/os-commands.ts'
-import { isMainSurface, openSurface, relayToMain, surface } from '../../store/shell.ts'
-import { $petPrefs } from '../pet/actions.ts'
+import { isMainSurface, openSurface, relayToMain } from '../../store/shell.ts'
 import { useDocumentVisible, useReducedMotion } from '../pet/hooks.ts'
 import { $petInfo } from '../pet/info.ts'
-import { assignPets, type PetAssignment } from '../petdex/assign.ts'
-import { spriteCache } from '../petdex/cache.ts'
+import { useRoomAssignment } from './assignment.ts'
+import { roomBridge } from './bridge.ts'
+import { roomTotal } from './model/costs.ts'
 import { factsOf } from './model/facts.ts'
 import { summarizeRoom } from './model/summary.ts'
 import type { RoomFact } from './model/types.ts'
 import { $roomPrefs } from './prefs.ts'
+import { RoomReplay } from './replay/RoomReplay.tsx'
 import { roomNotices, sameFacts } from './scene/labels.ts'
 import { RoomScene } from './scene/RoomScene.tsx'
 import { $room, answerRoomApproval, openRoomAgent, useRoomFeed } from './store.ts'
@@ -53,11 +54,34 @@ function openPetSettings(): void {
 
 const answer = (agentId: string, choice: ApprovalChoice) => void answerRoomApproval(agentId, choice)
 
+/** Whether there is a log to play back: it is kept now, or days of it are still on disk. */
+function useLogged(kept: boolean): boolean {
+  const [onDisk, setOnDisk] = useState(false)
+
+  useEffect(() => {
+    let current = true
+
+    void roomBridge()
+      ?.logDays()
+      .then(
+        days => current && setOnDisk(days.length > 0),
+        () => undefined
+      )
+
+    return () => {
+      current = false
+    }
+  }, [kept])
+
+  return kept || onDisk
+}
+
 /** The Room's window content, in a floating window (desktop mode, `active` false while minimized) or its own window (panels mode). */
 export function RoomWindow({ active = true }: { active?: boolean }) {
+  const [replaying, setReplaying] = useState(false)
   const visible = useDocumentVisible()
   const live = active && visible
-  useRoomFeed(live)
+  useRoomFeed(live && !replaying)
   const state = useStore($room)
   const prefs = useStore($roomPrefs)
   const info = useStore($petInfo)
@@ -65,16 +89,7 @@ export function RoomWindow({ active = true }: { active?: boolean }) {
   const reduced = useReducedMotion()
   const now = useNow(FACTS_MS, live)
   const agents = useMemo(() => Object.values(state.agents), [state.agents])
-  const petPrefs = useStore($petPrefs)
-  // In desktop mode the desktop pet draws from the same cache, so it keeps a sheet of its own there.
-  const cap = surface === 'desktop' && petShown(info) && !petPrefs.hidden ? spriteCache.cap - 1 : spriteCache.cap
-  const previous = useRef<Record<string, PetAssignment>>({})
-  const assignment = useMemo(() => {
-    const next = assignPets(agents, info.installed, prefs, previous.current, cap)
-    previous.current = next
-
-    return next
-  }, [agents, info.installed, prefs, cap])
+  const assignment = useRoomAssignment(agents)
   const shownFacts = useRef<Record<string, RoomFact[]>>({})
   const facts = useMemo(() => {
     const before = shownFacts.current
@@ -95,6 +110,13 @@ export function RoomWindow({ active = true }: { active?: boolean }) {
     () => roomNotices({ connected: connection === 'open', state: { toolProgress: state.toolProgress, caps: state.caps }, pets: info.installed.length }),
     [connection, state.toolProgress, state.caps, info.installed.length]
   )
+  const desks = useMemo(() => Object.values(state.desks ?? {}), [state.desks])
+  const total = useMemo(() => (prefs.costTotal ? roomTotal(state) : null), [prefs.costTotal, state])
+  const logged = useLogged(prefs.log)
+
+  if (replaying) {
+    return <RoomReplay active={active} onExit={() => setReplaying(false)} />
+  }
 
   return (
     <RoomScene
@@ -107,11 +129,18 @@ export function RoomWindow({ active = true }: { active?: boolean }) {
       active={live}
       settled={state.updatedAt > 0}
       facts={facts}
+      desks={desks}
+      deskNames={prefs.deskNames}
+      lane={prefs.elsewhere}
+      laneLive={liveOutside(prefs)}
       summary={summary}
       notices={notices}
+      meters={prefs.costs}
+      total={total}
       onOpen={openRoomAgent}
       onAnswer={answer}
       onPetSettings={openPetSettings}
+      onTimeLapse={logged ? () => setReplaying(true) : undefined}
     />
   )
 }

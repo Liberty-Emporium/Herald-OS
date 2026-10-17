@@ -26,10 +26,10 @@ vi.mock('../features/room/store.ts', () => ({ refreshRoomOnce: room.refresh }))
 vi.mock('../features/room/model/summary.ts', () => ({ summarizeRoom: room.summarize }))
 
 const UI: CommandContext = { source: 'ui' }
-const STATE: RoomState = { epoch: 'e1', agents: {}, seen: {}, handoffs: [], toolProgress: 'all', caps: { activeList: true, eventsSince: true, delegation: true, config: true }, updatedAt: 1 }
+const STATE: RoomState = { epoch: 'e1', agents: {}, seen: {}, handoffs: [], toolProgress: 'all', caps: { activeList: true, eventsSince: true, delegation: true, config: true, automations: true, sessionsDb: true }, updatedAt: 1 }
 const LINES = ['Budget review: reading Budget.xlsx', 'Trip plan: waiting for your OK', 'Find flights: running a command', 'Notes: idle']
 
-const summary = (counts: Partial<RoomSummary>): RoomSummary => ({ total: 0, working: 0, waiting: 0, idle: 0, helpers: 0, lines: [], ...counts })
+const summary = (counts: Partial<RoomSummary>): RoomSummary => ({ total: 0, working: 0, waiting: 0, idle: 0, helpers: 0, automations: 0, elsewhere: 0, lines: [], ...counts })
 
 function command(id: string) {
   const found = roomCommands.find(entry => entry.id === id)
@@ -92,6 +92,13 @@ describe('the Pet Room commands', () => {
     expect(text.startsWith('8 agents in the Pet Room, 2 of them helpers: 8 at work. Task 1: thinking.')).toBe(true)
     expect(text.endsWith('Task 6: thinking, and 2 more')).toBe(true)
     expect(describeRoom(summary({ total: 1, waiting: 1, lines: ['Trip plan: waiting for your OK'] }))).toBe('1 agent in the Pet Room: 1 waiting for you. Trip plan: waiting for your OK')
+  })
+
+  it('read out work outside Herald after the Room’s own, with the steps live detail brings', () => {
+    const lines = ['Trip plan (mission): reading Budget.xlsx', 'Support bot (outside Herald): running a command']
+
+    expect(describeRoom(summary({ total: 1, working: 1, elsewhere: 1, lines }))).toBe('1 agent in the Pet Room: 1 at work. Trip plan (mission): reading Budget.xlsx. Outside Herald: Support bot (outside Herald): running a command')
+    expect(describeRoom(summary({ elsewhere: 1, lines: lines.slice(1) }))).toBe('Nothing is at work in the Pet Room right now. Outside Herald: Support bot (outside Herald): running a command')
   })
 
   it('say plainly when Hermes cannot be asked', async () => {

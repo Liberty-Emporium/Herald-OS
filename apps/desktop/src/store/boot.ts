@@ -31,7 +31,8 @@ import { bindVoice } from './voice.ts'
 import { bindWake } from './wake.ts'
 import { surface } from './shell.ts'
 import { bindPetBrain } from '../features/pet/brain.ts'
-import { guardRoomReads } from '../features/room/store.ts'
+import { bindRoomCommandRelay } from '../features/room/commands.ts'
+import { bindRoomLog, guardRoomReads } from '../features/room/store.ts'
 import { bindPetInfo, bindPetSheet } from '../features/pet/info.ts'
 import { bindPetSnapshots } from '../features/pet/transport.ts'
 
@@ -95,6 +96,8 @@ export function bootRenderer(): void {
     bindNotificationHistory()
     bindBridgeSetupNotice()
     bindPetBrain()
+    bindRoomCommandRelay()
+    bindRoomLog()
   }
 
   if (surface === 'desktop') {

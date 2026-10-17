@@ -22,6 +22,15 @@ function isPanel(win: WmWindow): boolean {
   return win.ours && PANEL_TITLES.has(win.title)
 }
 
+/** What a relay does with a command, given the target's window: an `ifOpen` command never opens one. */
+export function relayStep(command: ShellCommand, targetWindow: 'missing' | 'loading' | 'loaded'): 'open' | 'queue' | 'send' | 'drop' {
+  if (targetWindow === 'missing') {
+    return command.ifOpen ? 'drop' : 'open'
+  }
+
+  return targetWindow === 'loaded' ? 'send' : 'queue'
+}
+
 const MENUBAR_HEIGHT = 30
 const DOCK_SIZE = { width: 720, height: 84 }
 const COMMAND_SIZE = { width: 680, height: 560 }
@@ -215,15 +224,18 @@ export class PanelShell implements ShellHost {
     log('shell', `opened web app ${name} (${url})`)
   }
 
-  /** Deliver a command to a surface, opening it first when needed. */
+  /** Deliver a command to a surface, opening it first when needed (`relayStep`). */
   relay(target: ShellSurface, command: ShellCommand): void {
-    let win = this.windows.get(target)
+    const open = this.surfaceWindow(target)
+    const step = relayStep(command, !open ? 'missing' : this.loaded.has(target) ? 'loaded' : 'loading')
 
-    if (!win || win.isDestroyed()) {
-      win = this.create(target)
+    if (step === 'drop') {
+      return
     }
 
-    if (this.loaded.has(target)) {
+    const win = open ?? this.create(target)
+
+    if (step === 'send') {
       win.webContents.send(IPC.shellCommand, command)
     } else {
       const queue = this.pending.get(target) ?? []
@@ -428,7 +440,8 @@ export class PanelShell implements ShellHost {
       case 'panel':
         return { ...PANEL_SIZE, transparent: true, resizable: false }
       case 'screensaver':
-        return { width: size.width, height: size.height, resizable: false }
+        // Resizable, so niri's full screen sets its size: the display Electron reports can be larger than the output niri fills.
+        return { width: size.width, height: size.height, resizable: true }
       case 'wallpaper':
         return { width: size.width, height: size.height, show: false, offscreen: true, focusable: false }
       case 'pet':

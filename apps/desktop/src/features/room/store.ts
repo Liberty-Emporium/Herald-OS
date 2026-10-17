@@ -1,30 +1,54 @@
 import { type ApprovalChoice, type GatewayEvent, JSON_RPC_METHOD_NOT_FOUND, type ServerRequest, type SessionEventsSinceResult } from '@herald-os/client'
 import { atom } from 'nanostores'
 import { useEffect } from 'react'
+import { liveOutside, type RoomActivity, type RoomPrefs } from '../../../shared/room.ts'
 import { approvalFacts } from '../../lib/approval-choices.ts'
+import { rest } from '../../lib/rest.ts'
+import { eventRuleFor } from '../../store/automations.ts'
 import { $activeChatId, $chats, openStoredSession } from '../../store/chat.ts'
 import { $connection, $connectionEpoch, $gatewayReady, gatewayRequest, isGatewayOpen, onAnyGatewayEvent, onServerRequest } from '../../store/gateway.ts'
+import { runCommand } from '../../store/os-commands.ts'
 import { $pendingRequests, type PendingRequest } from '../../store/requests.ts'
 import { $sessions } from '../../store/sessions.ts'
-import { isPanels, openSurface } from '../../store/shell.ts'
+import { isMainSurface, isPanels, openSurface, relayToMain } from '../../store/shell.ts'
 import { showPage } from '../../store/windows.ts'
+import { cronApi } from '../automations/api.ts'
 import { answerApproval } from '../pet/brain.ts'
+import { roomBridge } from './bridge.ts'
+import { watchRoomCommands } from './commands.ts'
+import { cronJobSignature, type RoomCronJob, type RoomCronRun, roomCronJob, roomCronRun } from './model/automations.ts'
+import { roomCostRow } from './model/costs.ts'
+import { roomDesks } from './model/desks.ts'
+import { ELSEWHERE_LIMIT, elsewhereRows, HERALD_SOURCES, NOT_ELSEWHERE, roomElsewhereRow } from './model/elsewhere.ts'
 import { approvalOf, roomFrame, roomHelperRecord, roomRequest, roomSessionMeta, roomSessionRow } from './model/frames.ts'
+import { createRoomLogger } from './model/log.ts'
+import { unlisted } from './model/outside.ts'
 import { EMPTY_ROOM, nextPruneAt, reduceRoom, type RoomInput } from './model/reducer.ts'
-import { earliestDue, emptyClock, type RoomClock, roomDue } from './model/schedule.ts'
+import { earliestDue, emptyClock, ROOM_TIMING, type RoomClock, roomDue, turnEnded } from './model/schedule.ts'
 import type { RoomApproval, RoomCaps, RoomState } from './model/types.ts'
+import { $roomPrefs } from './prefs.ts'
 
 /*
  * The Room's feed: Hermes's records and frames, read on the schedule in model/schedule.ts while
  * something shows the Room, folded by model/reducer.ts into `$room`. It only ever asks Hermes for
- * session.active_list, session.events.since, delegation.status and config.get, and answers an
- * approval (approval.respond, or this window's own card) only when the person picks an answer.
+ * session.active_list, session.events.since, delegation.status and config.get, Herald's automations
+ * and their latest runs (the Automations page's routes), only while the person has the lane on the
+ * session database's list for work elsewhere, and only while cost meters are on the database's
+ * rows for Herald's own sessions; it reads the documents Herald's own Office and Canvas windows
+ * have open and the commands agents ran there and, only while the person has live detail on, the
+ * activity main relays from Herald's bridge plugin in Hermes outside Herald. It never calls the
+ * `session.usage` method, which fetches account usage over the network. It answers an approval
+ * (approval.respond, or this window's own card) only when the person picks an answer. While the
+ * person keeps the activity log, the Hermes window feeds the Room even with nothing showing it and
+ * hands what changes to main (model/log.ts).
  */
 
 export { EMPTY_ROOM }
 
 /** A first read of a session takes at most this many of its latest frames. */
 const TAIL = 200
+/** How many of Herald's own sessions one cost read asks for, most recently active first. */
+const COSTS_LIMIT = 40
 /** Live frames are folded in together, at most this often. */
 const LIVE_BATCH_MS = 150
 const MIN_WAKE_MS = 50
@@ -34,12 +58,19 @@ const TOOL_PROGRESS = new Set(['all', 'new', 'verbose', 'off'])
 export const $room = atom<RoomState>(EMPTY_ROOM)
 
 let retains = 0
+/** The Hermes window keeps the activity log: the Room is fed then with nothing showing it, and while the window is hidden. */
+let logging = false
+/** The log has begun and not ended: it begins once the Room is fed and ends whenever it is not. */
+let logOpen = false
+const roomLog = createRoomLogger({ send: entries => roomBridge()?.appendLog(entries) })
 let clock: RoomClock = emptyClock()
 /** Bumped on every reset: answers to requests sent before it are dropped. */
 let generation = 0
 let helpersInitial = true
 let connectionEpoch: number | null = null
-const inflight = { list: false, helpers: false, config: false, sessions: new Set<string>() }
+const inflight = { list: false, helpers: false, config: false, sessions: new Set<string>(), automations: false, elsewhere: false, costs: false, desks: false }
+/** Each job's record as last read: a job whose record moves has its latest run read again. */
+const jobSignatures = new Map<string, string>()
 /** Sessions the Room is reading now: their open requests come back re-delivered. */
 const reading = new Set<string>()
 /** Sessions whose frames reach this window live, and so their requests too. */
@@ -49,6 +80,10 @@ let batch: RoomInput[] = []
 let batchTimer: ReturnType<typeof setTimeout> | null = null
 let unbindFeed: (() => void) | null = null
 let unguard: (() => void) | null = null
+/** Live activity from Hermes outside Herald, while the Room is fed and the person has live detail on. */
+let unwatchActivity: (() => void) | null = null
+/** The Room switches as the feed last saw them: they can change while nothing shows the Room. */
+let prefsSeen: RoomPrefs | null = null
 
 function heldHere(sessionId: string): boolean {
   return Boolean($chats.get()[sessionId]) || liveHere.has(sessionId)
@@ -83,7 +118,28 @@ function visible(): boolean {
 }
 
 function feeding(): boolean {
-  return retains > 0 && visible() && isGatewayOpen()
+  return ((retains > 0 && visible()) || logging) && isGatewayOpen()
+}
+
+/** Cost meters on a tag or in the header: only then are costs read. */
+const metersOn = (prefs: Pick<RoomPrefs, 'costs' | 'costTotal'> = $roomPrefs.get()): boolean => prefs.costs || prefs.costTotal
+
+/** New work outside Herald that live detail brought in and the lane has not listed. */
+function newlyUnlisted(before: RoomState, after: RoomState): boolean {
+  return Object.values(after.agents).some(agent => unlisted(agent) && !(before.agents[agent.id] && unlisted(before.agents[agent.id])))
+}
+
+/** A turn that ended has just changed its conversation's cost; work the lane has not listed wants the lane read soon. */
+function wantSoon(before: RoomState, after: RoomState): void {
+  const now = Date.now()
+
+  if (metersOn() && turnEnded(before, after)) {
+    clock.costsWanted ??= now + ROOM_TIMING.costsSoonMs
+  }
+
+  if ($roomPrefs.get().elsewhere && newlyUnlisted(before, after)) {
+    clock.elsewhereWanted ??= now + ROOM_TIMING.elsewhereSoonMs
+  }
 }
 
 function restartRound(): void {
@@ -91,6 +147,7 @@ function restartRound(): void {
   clock = emptyClock()
   helpersInitial = true
   liveHere.clear()
+  jobSignatures.clear()
   batch = []
 }
 
@@ -106,6 +163,11 @@ function commit(next: RoomState): void {
   }
 
   $room.set(next)
+  wantSoon(current, next)
+
+  if (logOpen) {
+    roomLog.update(next, Date.now())
+  }
 }
 
 function dispatch(input: RoomInput): void {
@@ -115,6 +177,23 @@ function dispatch(input: RoomInput): void {
 function reset(): void {
   restartRound()
   $room.set(reduceRoom($room.get(), { type: 'reset', epoch: null, at: Date.now() }))
+
+  if (logOpen) {
+    roomLog.update($room.get(), Date.now())
+  }
+}
+
+/** The log runs exactly while the Hermes window keeps it and the Room is fed; a gap in between is honest. */
+function syncLog(): void {
+  const wanted = logging && feeding()
+
+  if (wanted && !logOpen) {
+    logOpen = true
+    roomLog.start($room.get(), Date.now())
+  } else if (!wanted && logOpen) {
+    logOpen = false
+    roomLog.stop(Date.now())
+  }
 }
 
 /** A new connection (a reconnect, or a restarted backend) starts the Room over. */
@@ -136,9 +215,14 @@ function missingMethod(error: unknown): boolean {
   return Boolean(error && typeof error === 'object' && (error as { code?: unknown }).code === JSON_RPC_METHOD_NOT_FOUND)
 }
 
-/** A Hermes without the method: that part of the Room goes without it from now on. */
+/** A route this Hermes does not serve: `GET /api/… -> 404`, as Electron main words it. */
+function missingRoute(error: unknown): boolean {
+  return / -> 404\b/.test(error instanceof Error ? error.message : String(error))
+}
+
+/** A Hermes without the method or route: that part of the Room goes without it from now on. */
 function fallBack(error: unknown, cap: keyof RoomCaps): void {
-  if (missingMethod(error)) {
+  if (missingMethod(error) || missingRoute(error)) {
     dispatch({ type: 'caps', caps: { [cap]: false }, at: Date.now() })
   }
 }
@@ -303,6 +387,150 @@ async function readSession(sessionId: string): Promise<void> {
   }
 }
 
+/** A job as the Room shows it; one that runs when something happens is paused by design, so it does not count as paused. */
+function jobOf(raw: unknown): RoomCronJob | null {
+  const job = roomCronJob(raw)
+
+  return job && job.paused && eventRuleFor(job.id) ? { ...job, paused: false } : job
+}
+
+/**
+ * The job list, then the latest run of each job whose record moved or whose run is due; after
+ * `cron.changed` (`all`), of every job, as a run can start without its job's record showing it.
+ */
+async function readAutomations(dueRuns: readonly string[], all = false): Promise<void> {
+  const round = generation
+  const sentAt = Date.now()
+
+  inflight.automations = true
+  clock.jobsAt = sentAt
+  clock.jobsChangedAt = null
+
+  try {
+    const jobs = rowsOf(await cronApi.list(), jobOf)
+
+    if (round !== generation) {
+      return
+    }
+
+    const moved = jobs.filter(job => jobSignatures.get(job.key) !== cronJobSignature(job)).map(job => job.key)
+    const reading = jobs.filter(job => all || moved.includes(job.key) || dueRuns.includes(job.key))
+    const runs: Record<string, RoomCronRun | null> = {}
+
+    await Promise.all(
+      reading.map(async job => {
+        try {
+          runs[job.key] = rowsOf(await cronApi.runs(job, 1), roomCronRun)[0] ?? null
+          clock.runsAt[job.key] = Date.now()
+        } catch {
+          // The next round reads it again.
+        }
+      })
+    )
+
+    if (round !== generation) {
+      return
+    }
+
+    for (const job of jobs) {
+      if (moved.includes(job.key) || (all && job.key in runs && !runs[job.key]?.active)) {
+        // A run's session starts a moment after the scheduler claims it: read once more, soon.
+        clock.runsWanted[job.key] = Date.now() + ROOM_TIMING.runsRecheckMs
+      } else if (job.key in runs) {
+        delete clock.runsWanted[job.key]
+      }
+
+      jobSignatures.set(job.key, cronJobSignature(job))
+    }
+
+    dispatch({ type: 'automations', jobs, runs, at: Date.now() })
+  } catch (error) {
+    if (round === generation) {
+      fallBack(error, 'automations')
+    }
+  } finally {
+    inflight.automations = false
+    plan()
+  }
+}
+
+/** The elsewhere lane, only while the person has it on: Hermes's session list, cut down and filtered; each row's counts only with cost meters on. */
+async function readElsewhere(): Promise<void> {
+  const round = generation
+
+  inflight.elsewhere = true
+  clock.elsewhereAt = Date.now()
+  clock.elsewhereWanted = null
+
+  try {
+    const result = await rest.get<{ sessions?: unknown[] }>('/api/sessions', { limit: ELSEWHERE_LIMIT, order: 'recent', exclude_sources: NOT_ELSEWHERE.join(',') })
+
+    if (round !== generation || !$roomPrefs.get().elsewhere) {
+      return
+    }
+
+    const agents = Object.values($room.get().agents)
+    const sessionKeys = new Set(agents.flatMap(agent => (agent.id.startsWith('s:') && agent.sessionKey ? [agent.sessionKey] : [])))
+    const jobIds = new Set(agents.flatMap(agent => (agent.automation ? [agent.automation.jobId] : [])))
+    const counts = metersOn()
+    const rows = elsewhereRows(rowsOf(result?.sessions, raw => roomElsewhereRow(raw, counts)), { sessionKeys, jobIds }, Date.now())
+
+    dispatch({ type: 'elsewhere', rows, at: Date.now() })
+  } catch (error) {
+    if (round === generation) {
+      fallBack(error, 'sessionsDb')
+    }
+  } finally {
+    inflight.elsewhere = false
+    plan()
+  }
+}
+
+/** Herald's own sessions' token counts and cost from the session database, only while cost meters are on. */
+async function readCosts(): Promise<void> {
+  const round = generation
+
+  inflight.costs = true
+  clock.costsAt = Date.now()
+  clock.costsWanted = null
+
+  try {
+    const result = await rest.get<{ sessions?: unknown[] }>('/api/sessions', { limit: COSTS_LIMIT, order: 'recent', sources: HERALD_SOURCES.join(',') })
+
+    if (round === generation && metersOn()) {
+      dispatch({ type: 'costs', rows: rowsOf(result?.sessions, roomCostRow), at: Date.now() })
+    }
+  } catch (error) {
+    if (round === generation) {
+      fallBack(error, 'sessionsDb')
+    }
+  } finally {
+    inflight.costs = false
+    plan()
+  }
+}
+
+/** What a window reports, or nothing when it cannot say. */
+const presenceOf = (read: () => Promise<unknown[]>): Promise<unknown[]> =>
+  Promise.resolve()
+    .then(read)
+    .catch(() => [])
+
+/** The documents Herald's Office and Canvas windows have open, by name. */
+async function readDesks(): Promise<void> {
+  inflight.desks = true
+  clock.desksAt = Date.now()
+
+  try {
+    const [office, canvas] = await Promise.all([presenceOf(() => window.heraldOS.office.presence()), presenceOf(() => window.heraldOS.canvas.presence())])
+
+    dispatch({ type: 'desks', desks: roomDesks(office, canvas), at: Date.now() })
+  } finally {
+    inflight.desks = false
+    plan()
+  }
+}
+
 function flushLive(): void {
   batchTimer = null
 
@@ -316,6 +544,13 @@ function flushLive(): void {
 function onLive(event: GatewayEvent): void {
   if (event.type === 'sessions.changed') {
     clock.changedAt = Date.now()
+    plan()
+
+    return
+  }
+
+  if (event.type === 'cron.changed') {
+    clock.jobsChangedAt = Date.now()
     plan()
 
     return
@@ -335,6 +570,34 @@ function onLive(event: GatewayEvent): void {
   batchTimer ??= setTimeout(flushLive, LIVE_BATCH_MS)
 }
 
+function onActivity(events: RoomActivity[]): void {
+  if (!events.length || !liveOutside($roomPrefs.get())) {
+    return
+  }
+
+  batch.push({ type: 'outside', events, at: Date.now() })
+  batchTimer ??= setTimeout(flushLive, LIVE_BATCH_MS)
+}
+
+/** Activity already batched would bring back what turning live detail or the lane off took away. */
+function dropBatchedActivity(): void {
+  batch = batch.filter(input => input.type !== 'outside')
+}
+
+/** Watch live activity while the Room is fed and both switches are on; main replays the last minutes on each subscribe. */
+function syncActivity(): void {
+  const wanted = feeding() && liveOutside($roomPrefs.get())
+
+  if (wanted && !unwatchActivity) {
+    unwatchActivity = roomBridge()?.watchActivity(onActivity) ?? null
+  } else if (!wanted && unwatchActivity) {
+    unwatchActivity()
+    unwatchActivity = null
+  }
+}
+
+const dueOptions = () => ({ elsewhere: $roomPrefs.get().elsewhere, costs: metersOn() })
+
 function runDue(now: number): void {
   const prune = nextPruneAt($room.get())
 
@@ -342,10 +605,27 @@ function runDue(now: number): void {
     dispatch({ type: 'tick', now })
   }
 
-  const due = roomDue($room.get(), clock, pausedSessions())
+  const due = roomDue($room.get(), clock, pausedSessions(), dueOptions())
+  const dueRuns = Object.entries(due.runs).flatMap(([key, at]) => (at <= now ? [key] : []))
 
   if (!inflight.list && due.activeList <= now) {
     void readList()
+  }
+
+  if (!inflight.automations && (due.automations <= now || dueRuns.length > 0)) {
+    void readAutomations(dueRuns, clock.jobsChangedAt !== null && clock.jobsChangedAt + ROOM_TIMING.jobsChangedMs <= now)
+  }
+
+  if (!inflight.elsewhere && due.elsewhere <= now) {
+    void readElsewhere()
+  }
+
+  if (!inflight.costs && due.costs <= now) {
+    void readCosts()
+  }
+
+  if (!inflight.desks && due.desks <= now) {
+    void readDesks()
   }
 
   if (!inflight.helpers && due.delegation <= now) {
@@ -370,6 +650,9 @@ function plan(): void {
     timer = null
   }
 
+  syncActivity()
+  syncLog()
+
   if (!feeding()) {
     return
   }
@@ -378,7 +661,7 @@ function plan(): void {
   runDue(now)
 
   const state = $room.get()
-  const wake = Math.min(earliestDue(roomDue(state, clock, pausedSessions()), inflight), nextPruneAt(state) ?? Infinity)
+  const wake = Math.min(earliestDue(roomDue(state, clock, pausedSessions(), dueOptions()), inflight), nextPruneAt(state) ?? Infinity)
 
   if (Number.isFinite(wake)) {
     timer = setTimeout(plan, Math.max(MIN_WAKE_MS, wake - now))
@@ -396,8 +679,39 @@ function watchVisibility(): () => void {
   return () => document.removeEventListener('visibilitychange', onChange)
 }
 
+/** What the person's Room switches change for the feed: live detail and the lane going away, and cost meters wanting their reads now. */
+function onPrefs(before: RoomPrefs, prefs: RoomPrefs): void {
+  const state = $room.get()
+  const lane = state.elsewhereOn === true || Object.values(state.agents).some(agent => agent.kind === 'elsewhere')
+
+  if (liveOutside(before) && !liveOutside(prefs)) {
+    dropBatchedActivity()
+    dispatch({ type: 'outside_off', at: Date.now() })
+  }
+
+  if (lane && !prefs.elsewhere) {
+    dispatch({ type: 'elsewhere', rows: null, at: Date.now() })
+  } else if (!lane && prefs.elsewhere) {
+    clock.elsewhereAt = null
+  }
+
+  if (!metersOn(before) && metersOn(prefs)) {
+    clock.costsAt = null
+
+    if (prefs.elsewhere) {
+      clock.elsewhereWanted = Date.now()
+    }
+  }
+}
+
+function seePrefs(prefs: RoomPrefs): void {
+  onPrefs(prefsSeen ?? prefs, prefs)
+  prefsSeen = prefs
+}
+
 function start(): void {
   syncConnection()
+  seePrefs($roomPrefs.get())
 
   const offs = [
     onAnyGatewayEvent(onLive),
@@ -406,6 +720,11 @@ function start(): void {
       plan()
     }),
     $sessions.subscribe(rows => dispatch({ type: 'session_meta', rows: rowsOf(rows, roomSessionMeta), at: Date.now() })),
+    watchRoomCommands(commands => dispatch({ type: 'commands', commands, at: Date.now() })),
+    $roomPrefs.listen(prefs => {
+      seePrefs(prefs)
+      plan()
+    }),
     $connectionEpoch.listen(() => {
       syncConnection()
       plan()
@@ -426,6 +745,8 @@ function start(): void {
 function stop(): void {
   unbindFeed?.()
   unbindFeed = null
+  unwatchActivity?.()
+  unwatchActivity = null
 
   for (const pending of [timer, batchTimer]) {
     if (pending) {
@@ -437,15 +758,22 @@ function stop(): void {
   batchTimer = null
   batch = []
   liveHere.clear()
+  syncLog()
+}
+
+/** Feed the Room while something shows it or the log is kept, and not otherwise. */
+function follow(): void {
+  if ((retains > 0 || logging) && !unbindFeed) {
+    start()
+  } else if (retains === 0 && !logging && unbindFeed) {
+    stop()
+  }
 }
 
 /** Keep the Room fed (polling and live frames) while something shows it; returns the release. */
 export function retainRoom(): () => void {
   retains += 1
-
-  if (retains === 1) {
-    start()
-  }
+  follow()
 
   let released = false
 
@@ -456,10 +784,48 @@ export function retainRoom(): () => void {
 
     released = true
     retains -= 1
+    follow()
+  }
+}
 
-    if (retains === 0) {
-      stop()
+/**
+ * The Hermes window keeps the activity log while the person has it on (Settings > Pet Room): the
+ * Room is fed then even with nothing showing it, at its usual pace, and what it shows goes to main.
+ */
+export function bindRoomLog(): () => void {
+  if (!isMainSurface) {
+    return () => undefined
+  }
+
+  const keep = (on: boolean) => {
+    if (on !== logging) {
+      logging = on
+      follow()
+      plan()
     }
+  }
+  const leave = () => {
+    if (logOpen) {
+      logOpen = false
+      roomLog.stop(Date.now())
+    }
+  }
+
+  keep($roomPrefs.get().log)
+  const off = $roomPrefs.listen(prefs => keep(prefs.log))
+  window.addEventListener('pagehide', leave)
+
+  return () => {
+    off()
+    window.removeEventListener('pagehide', leave)
+    keep(false)
+  }
+}
+
+/** After the log was deleted: begin it again with what the Room shows now, so the new file starts whole. */
+export function restartRoomLog(): void {
+  if (logOpen) {
+    roomLog.start($room.get(), Date.now())
   }
 }
 
@@ -492,9 +858,17 @@ export async function refreshRoomOnce(): Promise<RoomState> {
     reads.push(readHelpers())
   }
 
+  if (state.caps.automations && !inflight.automations) {
+    reads.push(readAutomations([]))
+  }
+
+  if ($roomPrefs.get().elsewhere && state.caps.sessionsDb && !inflight.elsewhere) {
+    reads.push(readElsewhere())
+  }
+
   if (state.caps.eventsSince) {
     for (const agent of Object.values(state.agents)) {
-      if (agent.kind !== 'helper' && agent.sessionId && !inflight.sessions.has(agent.sessionId) && !paused.has(agent.sessionId)) {
+      if (agent.id.startsWith('s:') && agent.sessionId && !inflight.sessions.has(agent.sessionId) && !paused.has(agent.sessionId)) {
         reads.push(readSession(agent.sessionId))
       }
     }
@@ -542,11 +916,32 @@ export async function answerRoomApproval(agentId: string, choice: ApprovalChoice
   }
 }
 
-/** Open the agent's conversation in Hermes (a helper opens its parent's). */
+/** Automations, focused on the job, in the Hermes window (its own window in panels mode). */
+function showAutomation(name: string): void {
+  if (isMainSurface) {
+    void runCommand('automation.show', { name }, { source: 'ui' })
+
+    return
+  }
+
+  relayToMain({ type: 'os', args: ['automation.show'], payload: { name } })
+  openSurface('main')
+}
+
+/**
+ * Open the agent's conversation in Hermes (a helper opens its parent's), or an automation's job.
+ * Work elsewhere opens nothing: it belongs to another Hermes process.
+ */
 export function openRoomAgent(agentId: string): void {
   const agent = $room.get().agents[agentId]
 
-  if (!agent) {
+  if (!agent || agent.kind === 'elsewhere') {
+    return
+  }
+
+  if (agent.kind === 'automation') {
+    showAutomation(agent.title)
+
     return
   }
 

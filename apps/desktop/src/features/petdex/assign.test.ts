@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { InstalledPet } from '../../../shared/pet.ts'
-import { ROOM_PREFS_DEFAULTS, type RoomKind, type RoomPrefs } from '../../../shared/room.ts'
-import { assignPets, kindPets, type PetAssignment } from './assign.ts'
+import { ROOM_KINDS, ROOM_PREFS_DEFAULTS, type RoomKind, type RoomPrefs } from '../../../shared/room.ts'
+import { assignPets, kindPets, type PetAssignment, ROOM_SHEET_CAP } from './assign.ts'
 import { PET_TINTS } from './draw.ts'
 
 const CAP = 4
@@ -13,29 +13,29 @@ const tintsOf = (assigned: Record<string, PetAssignment>) => Object.values(assig
 
 describe('kindPets', () => {
   it('has no pet for any kind when none is installed', () => {
-    expect(kindPets([], prefs({ conversation: 'boba' }))).toEqual({ conversation: null, mission: null, helper: null, automation: null })
+    expect(kindPets([], prefs({ conversation: 'boba' }))).toEqual({ conversation: null, mission: null, helper: null, automation: null, elsewhere: null })
   })
 
   it('gives each kind of work its own pet, in kind order over the installed pets, when there are enough', () => {
-    expect(kindPets(pets('a', 'b', 'c', 'd', 'e'), prefs())).toEqual({ conversation: 'a', mission: 'b', helper: 'c', automation: 'd' })
+    expect(kindPets(pets('a', 'b', 'c', 'd', 'e'), prefs())).toEqual({ conversation: 'a', mission: 'b', helper: 'c', automation: 'd', elsewhere: 'e' })
   })
 
   it('goes round the installed pets again when there are fewer than kinds', () => {
-    expect(kindPets(pets('a', 'b'), prefs())).toEqual({ conversation: 'a', mission: 'b', helper: 'a', automation: 'b' })
-    expect(kindPets(pets('solo'), prefs())).toEqual({ conversation: 'solo', mission: 'solo', helper: 'solo', automation: 'solo' })
+    expect(kindPets(pets('a', 'b'), prefs())).toEqual({ conversation: 'a', mission: 'b', helper: 'a', automation: 'b', elsewhere: 'a' })
+    expect(kindPets(pets('solo'), prefs())).toEqual({ conversation: 'solo', mission: 'solo', helper: 'solo', automation: 'solo', elsewhere: 'solo' })
   })
 
   it('takes the person’s choice for a kind, and gives the other kinds the pets nobody chose', () => {
-    expect(kindPets(pets('a', 'b', 'c', 'd'), prefs({ mission: 'a' }))).toEqual({ conversation: 'b', mission: 'a', helper: 'c', automation: 'd' })
-    expect(kindPets(pets('a', 'b', 'c'), prefs({ conversation: 'c', helper: 'c' }))).toEqual({ conversation: 'c', mission: 'a', helper: 'c', automation: 'b' })
+    expect(kindPets(pets('a', 'b', 'c', 'd'), prefs({ mission: 'a' }))).toEqual({ conversation: 'b', mission: 'a', helper: 'c', automation: 'd', elsewhere: 'b' })
+    expect(kindPets(pets('a', 'b', 'c'), prefs({ conversation: 'c', helper: 'c' }))).toEqual({ conversation: 'c', mission: 'a', helper: 'c', automation: 'b', elsewhere: 'a' })
   })
 
   it('shares the chosen pets round when the person chose every installed one', () => {
-    expect(kindPets(pets('a', 'b'), prefs({ conversation: 'b', mission: 'a' }))).toEqual({ conversation: 'b', mission: 'a', helper: 'a', automation: 'b' })
+    expect(kindPets(pets('a', 'b'), prefs({ conversation: 'b', mission: 'a' }))).toEqual({ conversation: 'b', mission: 'a', helper: 'a', automation: 'b', elsewhere: 'a' })
   })
 
   it('ignores a chosen pet that is not installed', () => {
-    expect(kindPets(pets('a', 'b', 'c', 'd'), prefs({ conversation: 'ghost' }))).toEqual({ conversation: 'a', mission: 'b', helper: 'c', automation: 'd' })
+    expect(kindPets(pets('a', 'b', 'c', 'd'), prefs({ conversation: 'ghost' }))).toEqual({ conversation: 'a', mission: 'b', helper: 'c', automation: 'd', elsewhere: 'a' })
   })
 })
 
@@ -129,6 +129,15 @@ describe('assignPets', () => {
     })
     expect(new Set(Object.values(assignPets(agents, installed, prefs(), {}, 1)).map(pet => pet.slug))).toEqual(new Set(['alpha']))
     expect(new Set(Object.values(assignPets(agents, installed, prefs(), {}, 3)).map(pet => pet.slug)).size).toBe(3)
+  })
+
+  it('gives five kinds of work five distinct sheets when five pets are installed', () => {
+    const agents = ROOM_KINDS.map((kind, index) => agent(`${kind}:${index}`, kind))
+    const assigned = assignPets(agents, pets('alpha', 'boba', 'mochi', 'zed', 'kiwi'), prefs(), {}, ROOM_SHEET_CAP)
+
+    expect(ROOM_SHEET_CAP).toBe(5)
+    expect(new Set(Object.values(assigned).map(pet => pet.slug))).toEqual(new Set(['alpha', 'boba', 'mochi', 'zed', 'kiwi']))
+    expect(tintsOf(assigned)).toEqual([null, null, null, null, null])
   })
 
   it('keeps the pets that still fit when the cap shrinks, and stays put when it grows again', () => {

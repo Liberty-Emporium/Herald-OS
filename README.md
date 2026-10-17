@@ -79,6 +79,10 @@ Run this once, then open Herald OS from Applications:
 xattr -dr com.apple.quarantine "/Applications/Herald OS.app"
 ```
 
+Or, without Terminal: open Herald OS once and close the warning, then go to System Settings >
+Privacy & Security, scroll to Security, click Open Anyway next to "Herald OS was blocked", and
+confirm with your password. Since macOS Sequoia, right-click > Open no longer skips the warning.
+
 Herald OS takes over the screen: `Cmd+Ctrl+F` leaves or re-enters fullscreen and `Cmd+Q` quits. On
 its first start it adds its system tools to Hermes (`~/.hermes/plugins/herald-os-bridge`). macOS asks
 for each of these the first time a feature needs it:
@@ -349,7 +353,7 @@ abilities as a regular Hermes plugin, `herald-os-bridge`.
   conversation, folder and files; its suggested next step starts only when you click it.
 - **A command bar** for every action in the OS: open pages and apps, add memories, run automations,
   start missions.
-- **Your language**: English or Simplified Chinese (简体中文), following the system's language
+- **Your language**: English, Brazilian Portuguese (Português (Brasil)) or Simplified Chinese (简体中文), following the system's language
   unless you pick one in Settings > General. The menus, menu bar, Overview, command bar and Settings'
   main pages are translated so far, and more follows; see [docs/TRANSLATING.md](docs/TRANSLATING.md)
   to help.
@@ -374,16 +378,23 @@ abilities as a regular Hermes plugin, `herald-os-bridge`.
   masters and a presenter view. Ask Hermes for a cover letter, a cleaner column or slides from a
   report and watch each change land as a step you can undo. Before Herald first saves over a file,
   it says what the file would lose and backs it up. See [the manual](docs/manual/office.md).
+- **Herald Calc**: a notepad where you write math the way you say it ("20% of 84.50", "5 km in
+  miles", "100 USD in BRL", "days until Dec 25", "9am Sydney in New York") and every line answers
+  as you type, in exact decimals. A classic keypad with scientific and programmer modes, graphs you
+  can pan, zoom and trace, a searchable history, and a note becomes a workbook with real formulas in
+  one click. Hermes uses the same engine for math, so its numbers are worked out, not guessed. See
+  [the manual](docs/manual/calc.md).
 - **A desktop pet**: Hermes's own petdex pet on the desktop, the same one its CLI, TUI and desktop
   app show. It acts out what Hermes is doing, holds up approvals for you to answer, takes questions
   in a chat bubble and files you drop on it, walks over to the window Hermes works in, and gets out
   of the way for full screen, presentations and screen shares. See
   [the manual](docs/manual/pet.md).
-- **The Pet Room**: a window where every conversation, mission and helper Hermes is working on
-  stands as a petdex pet of its own. Pets walk to the area for the tool they use, say the step
-  they are on, hand notes to the helpers they start and get the results back, and hold up a sign
-  when they need your OK, from what Hermes reports and nothing else. See
-  [the manual](docs/manual/room.md).
+- **The Pet Room**: a window where every conversation, mission, helper and automation Hermes is
+  working on stands as a petdex pet of its own. Pets walk to the area for the tool they use, stand
+  at the desk of the document they work on, say the step they are on, hand notes to the helpers they
+  start and get the results back, and hold up a sign when they need your OK, from what Hermes
+  reports and nothing else. A lane for Hermes at work outside Herald and the room as your
+  screensaver are there when you turn them on. See [the manual](docs/manual/room.md).
 - **Make it yours**: twelve themes (two light) that also dress Hermes's own command line, a theme
   made from any image, themes installed from git, your own fonts, and Hermes can design one from a
   description. Widgets for the menu bar, the Overview or their own window run sandboxed with only
@@ -416,6 +427,10 @@ To work on Herald OS, or to run what is on `main`:
 - **Herald OS Linux in a virtual machine** gives you the whole operating system, built from your
   checkout. The first setup takes about half an hour, most of it downloads.
 - **Herald OS on macOS** runs from your checkout in a few minutes if you already have Node.js.
+- **Your own Herald OS image**, the bootable system the installer and the VM disks are made from,
+  builds from your checkout with Podman on Linux. [docs/BUILDING-THE-IMAGE.md](docs/BUILDING-THE-IMAGE.md)
+  covers the recipe, the build, switching a machine to your build, and adding packages, Flatpaks
+  and branding.
 
 ### Herald OS Linux in a virtual machine
 
@@ -711,8 +726,12 @@ does not change the shell's code. Moving the pin is described in [upstream/READM
   run `hermes doctor`. If Hermes lives somewhere other than `~/.hermes/hermes-agent` and is not on
   your PATH, start with `HERALD_OS_HERMES_ROOT=/path/to/hermes-agent npm run dev`. The cause is
   usually in `~/.hermes/logs/herald-os.log`.
-- **macOS says Herald OS "is damaged" or "cannot be opened".** The build is not notarized yet: run
-  `xattr -dr com.apple.quarantine "/Applications/Herald OS.app"` and open it again.
+- **macOS says Herald OS "is damaged", "cannot be opened" or "Apple could not verify Herald OS is
+  free of malware".** The build is not notarized yet: run
+  `xattr -dr com.apple.quarantine "/Applications/Herald OS.app"` and open it again, or click Open
+  Anyway in System Settings > Privacy & Security after the first attempt. 0.1.0-alpha.4
+  shipped without a signature over the app bundle; if it still says "damaged", sign your copy ad
+  hoc with `codesign --force --deep --sign - "/Applications/Herald OS.app"`.
 - **Hermes uses shell commands instead of its system tools.** `hermes plugins list` should show
   `herald-os-bridge` as enabled; `hermes plugins enable herald-os-bridge` turns it on. From a
   checkout, re-run `npm run bootstrap`; on Linux, `herald-os setup`. Then restart Herald OS.

@@ -1,5 +1,5 @@
 import { nameOf, roomToolCall, type RoomToolCall, shortName } from './areas.ts'
-import type { RoomApproval, RoomLiveStatus, RoomResult, RoomSessionMeta } from './types.ts'
+import type { RoomApproval, RoomLiveStatus, RoomResult, RoomSessionCounts, RoomSessionMeta } from './types.ts'
 
 /*
  * The Room's boundary: what Hermes sends is cut down here, on arrival, to the few facts the Room
@@ -43,6 +43,11 @@ export interface RoomHelperFacts {
   durationSeconds: number | null
   filesRead: number | null
   filesWritten: number | null
+  inputTokens: number | null
+  outputTokens: number | null
+  reasoningTokens: number | null
+  apiCalls: number | null
+  costUsd: number | null
 }
 
 interface FrameBase {
@@ -57,7 +62,9 @@ interface FrameBase {
 export type RoomFrame = FrameBase &
   (
     | { type: 'message.start' }
-    | { type: 'message.complete'; status: 'complete' | 'error' | 'interrupted' | null }
+    | { type: 'message.complete'; status: 'complete' | 'error' | 'interrupted' | null; usage: RoomSessionCounts | null }
+    /** `session.usage`: the running totals, ticked while a turn runs. */
+    | { type: 'usage'; usage: RoomSessionCounts }
     | { type: 'tool.start'; toolId: string | null; tool: string; call: RoomToolCall; signature: string }
     | { type: 'tool.complete'; toolId: string | null; tool: string | null }
     | { type: 'guardrail'; tool: string; code: RoomGuardrailCode }
@@ -165,6 +172,14 @@ function titleOf(value: unknown): string | null {
   return typeof value === 'string' ? shortName(value, TITLE_MAX) : null
 }
 
+/** A frame's `usage`: its four counts, never the model's name or anything else it carries. */
+function countsOf(value: unknown): RoomSessionCounts | null {
+  const usage = record(value)
+  const counts = { input: count(usage.input), output: count(usage.output), reasoning: count(usage.reasoning), calls: count(usage.calls) }
+
+  return Object.values(counts).some(entry => entry !== null) ? counts : null
+}
+
 function stable(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map(stable).join(',')}]`
@@ -230,7 +245,12 @@ function helperFacts(sessionId: string, payload: Record<string, unknown>, stage:
     summary: complete && typeof payload.summary === 'string' ? summaryLine(payload.summary) : null,
     durationSeconds: complete ? count(payload.duration_seconds) : null,
     filesRead: complete && Array.isArray(payload.files_read) ? payload.files_read.length : null,
-    filesWritten: complete && Array.isArray(payload.files_written) ? payload.files_written.length : null
+    filesWritten: complete && Array.isArray(payload.files_written) ? payload.files_written.length : null,
+    inputTokens: complete ? count(payload.input_tokens) : null,
+    outputTokens: complete ? count(payload.output_tokens) : null,
+    reasoningTokens: complete ? count(payload.reasoning_tokens) : null,
+    apiCalls: complete ? count(payload.api_calls) : null,
+    costUsd: complete ? count(payload.cost_usd) : null
   }
 }
 
@@ -254,7 +274,12 @@ export function roomFrame(raw: unknown): RoomFrame | null {
     case 'message.complete': {
       const status = text(payload.status)
 
-      return { ...base, type: 'message.complete', status: status && TURN_STATUSES.has(status) ? (status as 'complete' | 'error' | 'interrupted') : null }
+      return { ...base, type: 'message.complete', status: status && TURN_STATUSES.has(status) ? (status as 'complete' | 'error' | 'interrupted') : null, usage: countsOf(payload.usage) }
+    }
+    case 'session.usage': {
+      const usage = countsOf(payload.usage)
+
+      return usage ? { ...base, type: 'usage', usage } : { ...base, type: 'activity', turn: true }
     }
     case 'tool.start': {
       const tool = toolName(payload.name)

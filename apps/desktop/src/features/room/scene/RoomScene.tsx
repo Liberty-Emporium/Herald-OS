@@ -8,13 +8,14 @@ import { cn } from '../../../lib/cn.ts'
 import type { PetAssignment } from '../../petdex/assign.ts'
 import { spriteCache } from '../../petdex/cache.ts'
 import { petClock } from '../../petdex/clock.ts'
+import type { RoomMeter } from '../model/costs.ts'
 import type { RoomSummary } from '../model/summary.ts'
-import type { RoomAgent, RoomArea, RoomFact, RoomHandoff } from '../model/types.ts'
+import type { RoomAgent, RoomDesk, RoomFact, RoomHandoff } from '../model/types.ts'
 import { AgentOverlay } from './AgentOverlay.tsx'
 import { ApprovalPopover, type PopoverPlacement, placePopover } from './ApprovalPopover.tsx'
 import { createRoomEngine, type PetFrame, type PetMarks, type RoomEngine } from './engine.ts'
-import { agentLine, EMPTY_ROOM_TEXT, moreText, type RoomNotice } from './labels.ts'
-import { layoutRoom, MAX_PETS, pickShown, type SceneLayout } from './layout.ts'
+import { agentLine, EMPTY_LANE_TEXT, EMPTY_ROOM_TEXT, moreText, type RoomNotice } from './labels.ts'
+import { AREA_DEFS, type DeskInput, deskSpot, laneCapacity, layoutRoom, MAX_PETS, pickShown, type RoomSpot, type SceneLayout } from './layout.ts'
 import { paintPets } from './paint.ts'
 import { RoomBackdrop } from './RoomBackdrop.tsx'
 import { RoomHeader } from './RoomHeader.tsx'
@@ -35,13 +36,33 @@ export interface RoomSceneProps {
   /** The Room has heard from Hermes, so what it holds at first was already there. */
   settled: boolean
   facts: Readonly<Record<string, readonly RoomFact[]>>
+  /** The open documents, as desks in their areas. */
+  desks?: readonly RoomDesk[]
+  /** Desks show their documents' names. */
+  deskNames?: boolean
+  /** The lane for work outside Herald, which the person turned on. */
+  lane?: boolean
+  /** The lane shows live steps, which the person turned on as well. */
+  laneLive?: boolean
+  /** What the lane says at its top and while it is empty, for a scene that is not the live Room. */
+  laneText?: { note: string; about: string; empty: string }
+  /** Name tags, facts, Hermes's result summaries and the words on the furniture; off for a screensaver. */
+  names?: boolean
+  /** Pets open their conversations and signs open the approval card; off for a screensaver, which only ever shows. */
+  interactive?: boolean
   /** The header and its notices; off for a screensaver. */
   chrome?: boolean
   summary?: RoomSummary | null
   notices?: readonly RoomNotice[]
+  /** A token and cost meter on each name tag; off unless the person turns meters on, and never in a screensaver. */
+  meters?: boolean
+  /** The meters' total in the header, when the person shows it. */
+  total?: RoomMeter | null
   onOpen: (agentId: string) => void
   onAnswer: (agentId: string, choice: ApprovalChoice) => void
   onPetSettings?: () => void
+  /** Opens the time-lapse; the header offers it only when this is given. */
+  onTimeLapse?: () => void
   className?: string
 }
 
@@ -58,7 +79,14 @@ interface Marks {
 
 const NO_MARKS: Marks = { marks: {}, gone: new Set() }
 const NO_FACTS: readonly RoomFact[] = []
+const NO_DESKS: readonly RoomDesk[] = []
 const WORKING = new Set<RoomAgent['phase']>(['tool', 'thinking', 'starting'])
+
+const inLane = (agent: RoomAgent): boolean => agent.area === 'elsewhere'
+
+/** The lane's order: active work first, then the most recently active. */
+const laneOrder = (a: RoomAgent, b: RoomAgent): number =>
+  Number(Boolean(b.elsewhere?.active)) - Number(Boolean(a.elsewhere?.active)) || (b.elsewhere?.lastActiveAt ?? 0) - (a.elsewhere?.lastActiveAt ?? 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
 
 /** The element's laid-out size (transforms such as a window's opening animation do not count) and the display's pixel ratio. */
 function useSceneSize(ref: RefObject<HTMLElement | null>): SceneSize | null {
@@ -89,19 +117,24 @@ function useSceneSize(ref: RefObject<HTMLElement | null>): SceneSize | null {
   return size
 }
 
-/** The stations that glow, as a stable key: where a pet works, and the bench while one waits on it. */
-function glowingAreas(agents: readonly RoomAgent[]): string {
-  const areas = new Set<RoomArea>()
+/** The stations that glow, as a stable key: where a pet works (and the desk it works at), and the bench while one waits on it. */
+function glowingSpots(agents: readonly RoomAgent[], layout: SceneLayout | null): string {
+  const spots = new Set<RoomSpot>()
+  const desks = new Set(layout?.stations.filter(station => station.wall === 'desk').map(station => station.id))
 
   for (const agent of agents) {
-    if (WORKING.has(agent.phase) && agent.area !== 'bench' && agent.area !== 'lounge') {
-      areas.add(agent.area)
+    if (WORKING.has(agent.phase) && agent.area !== 'bench' && agent.area !== 'lounge' && agent.area !== 'elsewhere') {
+      spots.add(agent.area)
+
+      if (agent.desk && desks.has(deskSpot(agent.desk))) {
+        spots.add(deskSpot(agent.desk))
+      }
     } else if (agent.area === 'bench' && (agent.phase === 'waiting' || agent.approval || agent.asking)) {
-      areas.add('bench')
+      spots.add('bench')
     }
   }
 
-  return [...areas].sort().join(',')
+  return [...spots].sort().join(',')
 }
 
 /** How near a side a pet may stand before its bubble opens toward the middle of the room instead of over it. */
@@ -119,7 +152,34 @@ function place(root: HTMLElement, x: number, y: number, opacity: number, depth: 
  * The room: stations drawn once per size, every pet on one canvas, and over them the buttons, name
  * tags, bubbles and signs, which follow the pets through refs rather than React renders.
  */
-export function RoomScene({ agents, handoffs, assignment, installed, steps, motion, active, settled, facts, chrome = true, summary = null, notices = [], onOpen, onAnswer, onPetSettings, className }: RoomSceneProps) {
+export function RoomScene({
+  agents,
+  handoffs,
+  assignment,
+  installed,
+  steps,
+  motion,
+  active,
+  settled,
+  facts,
+  desks = NO_DESKS,
+  deskNames = true,
+  lane = false,
+  laneLive = false,
+  laneText,
+  names = true,
+  interactive = true,
+  chrome = true,
+  summary = null,
+  notices = [],
+  meters = false,
+  total = null,
+  onOpen,
+  onAnswer,
+  onPetSettings,
+  onTimeLapse,
+  className
+}: RoomSceneProps) {
   const key = `room-scene:${useId()}`
   const floorRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -136,13 +196,28 @@ export function RoomScene({ agents, handoffs, assignment, installed, steps, moti
   const [marks, setMarks] = useState<Marks>(NO_MARKS)
   const [sign, setSign] = useState<{ id: string; requestId: string; placement: PopoverPlacement } | null>(null)
   const size = useSceneSize(floorRef)
-  const layout = useMemo(() => (size ? layoutRoom(size.width, size.height) : null), [size?.width, size?.height])
-  const { shown, more } = useMemo(() => pickShown(agents, MAX_PETS, shownBefore.current), [agents])
+  const deskInputs = useMemo<DeskInput[]>(() => desks.map(({ id, area, name }) => ({ id, area, name })), [desks])
+  const metered = meters && names
+  const layout = useMemo(() => (size ? layoutRoom(size.width, size.height, AREA_DEFS, { desks: deskInputs, lane, meters: metered }) : null), [size?.width, size?.height, deskInputs, lane, metered])
+  const capacity = layout ? laneCapacity(layout) : 0
+  const { shown, more, laneMore } = useMemo(() => {
+    const room = pickShown(
+      agents.filter(agent => !inLane(agent)),
+      MAX_PETS,
+      shownBefore.current
+    )
+    const outside = lane ? agents.filter(inLane).sort(laneOrder) : []
+
+    return { shown: [...room.shown, ...outside.slice(0, capacity)], more: room.more, laneMore: Math.max(0, outside.length - capacity) }
+  }, [agents, lane, capacity])
   const known = useMemo(() => new Set(agents.map(agent => agent.id)), [agents])
   const still = motion === 'still'
   const visible = shown.filter(agent => !marks.gone.has(agent.id))
-  const raised = sign ? (visible.find(agent => agent.id === sign.id && agent.approval?.requestId === sign.requestId) ?? null) : null
+  const raised = interactive && sign ? (visible.find(agent => agent.id === sign.id && agent.approval?.requestId === sign.requestId) ?? null) : null
   const raisedId = raised?.id ?? null
+  const inRoom = agents.some(agent => !inLane(agent) && !(agent.kind === 'automation' && agent.phase === 'idle'))
+  // Live work outside Herald may stand at a station or the bench: the lane is only empty when there is none at all.
+  const laneEmpty = lane && !agents.some(agent => agent.kind === 'elsewhere')
 
   useEffect(() => {
     agentsRef.current = agents
@@ -171,7 +246,7 @@ export function RoomScene({ agents, handoffs, assignment, installed, steps, moti
 
         if (root) {
           placed.add(frame.id)
-          place(root, frame.x, frame.y, frame.opacity, raisedRef.current === frame.id ? frames.length + 1 : index + 1, at.width)
+          place(root, frame.x, frame.y, frame.opacity, raisedRef.current === frame.id ? frames.length + 1 : index + 1, at.wall.width)
         }
       })
 
@@ -267,7 +342,7 @@ export function RoomScene({ agents, handoffs, assignment, installed, steps, moti
         const spot = spots.current.get(id)
 
         if (spot) {
-          place(element, spot.x, spot.y, 1, 1, layoutRef.current?.width ?? Number.POSITIVE_INFINITY)
+          place(element, spot.x, spot.y, 1, 1, layoutRef.current?.wall.width ?? Number.POSITIVE_INFINITY)
         } else {
           element.style.visibility = 'hidden'
         }
@@ -293,14 +368,14 @@ export function RoomScene({ agents, handoffs, assignment, installed, steps, moti
     })
   }, [])
 
-  const glowKey = glowingAreas(visible)
-  const glowing = useMemo(() => new Set(glowKey ? (glowKey.split(',') as RoomArea[]) : []), [glowKey])
+  const glowKey = glowingSpots(visible, layout)
+  const glowing = useMemo(() => new Set(glowKey ? (glowKey.split(',') as RoomSpot[]) : []), [glowKey])
 
   return (
     <div className={cn('relative flex h-full w-full flex-col overflow-hidden text-fg', className)}>
-      {chrome && <RoomHeader summary={summary} notices={notices} onPetSettings={onPetSettings} />}
+      {chrome && <RoomHeader summary={summary} notices={notices} total={total} onPetSettings={onPetSettings} onTimeLapse={onTimeLapse} />}
       <div ref={floorRef} className="relative min-h-0 flex-1 overflow-hidden">
-        {layout && <RoomBackdrop layout={layout} glowing={glowing} still={still} />}
+        {layout && <RoomBackdrop layout={layout} glowing={glowing} still={still} deskNames={deskNames && names} words={names} laneLive={laneLive} laneText={laneText} />}
         <canvas ref={canvasRef} aria-hidden="true" className="pointer-events-none absolute top-0 left-0" style={layout ? { width: layout.width, height: layout.height } : undefined} />
         {layout && (
           <div className="pointer-events-none absolute inset-0">
@@ -311,6 +386,9 @@ export function RoomScene({ agents, handoffs, assignment, installed, steps, moti
                 pet={layout.pet}
                 facts={facts[agent.id] ?? NO_FACTS}
                 steps={steps}
+                names={names}
+                interactive={interactive && agent.kind !== 'elsewhere'}
+                meters={meters}
                 marks={marks.marks[agent.id] ?? null}
                 still={still}
                 signOpen={raised?.id === agent.id}
@@ -335,8 +413,8 @@ export function RoomScene({ agents, handoffs, assignment, installed, steps, moti
             ))}
           </div>
         )}
-        {layout && settled && agents.length === 0 && (
-          <div className="pointer-events-none absolute inset-x-0 flex items-center justify-center px-6" style={{ top: layout.wall.height, bottom: layout.height - layout.door.y }}>
+        {layout && names && settled && !inRoom && (
+          <div className="pointer-events-none absolute left-0 flex items-center justify-center px-6" style={{ width: layout.wall.width, top: layout.wall.height, bottom: layout.height - layout.door.y }}>
             <div className={cn('glass-card flex max-w-sm flex-col items-center gap-2.5 rounded-2xl px-6 py-5 text-center', !still && 'animate-rise')}>
               <span className="icon-tile size-10">
                 <IconPaw size={20} />
@@ -345,16 +423,25 @@ export function RoomScene({ agents, handoffs, assignment, installed, steps, moti
             </div>
           </div>
         )}
-        {more > 0 && (
-          <div className="absolute bottom-2 left-1/2 -translate-x-1/2" title={`The Room shows the busiest ${MAX_PETS}`}>
+        {layout?.lane && names && (laneEmpty || laneMore > 0) && (
+          <div className="pointer-events-none absolute flex justify-center px-2" style={{ left: layout.lane.x, width: layout.lane.width, ...(laneEmpty ? { top: layout.lane.y + 64 } : { bottom: 8 }) }}>
+            {laneEmpty ? <span className="text-center text-[10.5px] leading-snug text-fg-4">{laneText?.empty ?? EMPTY_LANE_TEXT}</span> : <Pill tone="muted">{moreText(laneMore)}</Pill>}
+          </div>
+        )}
+        {names && more > 0 && (
+          <div className="absolute bottom-2 -translate-x-1/2" style={{ left: layout ? layout.wall.width / 2 : '50%' }} title={`The Room shows the busiest ${MAX_PETS}`}>
             <Pill tone="muted">{moreText(more)}</Pill>
           </div>
         )}
-        <ul className="sr-only" aria-label="What the pets are doing">
-          {agents.map(agent => (
-            <li key={agent.id}>{agentLine(agent, facts[agent.id] ?? NO_FACTS)}</li>
-          ))}
-        </ul>
+        {names && (
+          <ul className="sr-only" aria-label="What the pets are doing">
+            {agents
+              .filter(agent => lane || !inLane(agent))
+              .map(agent => (
+                <li key={agent.id}>{agentLine(agent, facts[agent.id] ?? NO_FACTS)}</li>
+              ))}
+          </ul>
+        )}
       </div>
     </div>
   )

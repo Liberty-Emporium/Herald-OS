@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { RoomAgent, RoomApproval, RoomCaps, RoomFact } from '../model/types.ts'
-import { agentLine, agentTitle, BUBBLE_CHARS, bubbleText, capsNotice, countsOf, displayStep, doingText, roomNotices, sameFacts, tagFacts } from './labels.ts'
+import { agentLine, agentTitle, BUBBLE_CHARS, bubbleText, capsNotice, countsOf, displayStep, doingText, laneWords, roomNotices, sameFacts, tagFacts } from './labels.ts'
 
 function agent(patch: Partial<RoomAgent> = {}): RoomAgent {
   return {
@@ -24,6 +24,10 @@ function agent(patch: Partial<RoomAgent> = {}): RoomAgent {
     guardrail: null,
     result: null,
     toolCount: null,
+    desk: null,
+    automation: null,
+    elsewhere: null,
+    usage: null,
     trace: {},
     ...patch
   }
@@ -36,7 +40,7 @@ const approval: RoomApproval = {
   params: { description: null, command: null, tool_name: null, choices: null, allow_permanent: null, allow_session: null }
 }
 
-const ALL_CAPS: RoomCaps = { activeList: true, eventsSince: true, delegation: true, config: true }
+const ALL_CAPS: RoomCaps = { activeList: true, eventsSince: true, delegation: true, config: true, automations: true, sessionsDb: true }
 
 describe('agentTitle', () => {
   it('uses the title Hermes gave, trimmed', () => {
@@ -100,7 +104,7 @@ describe('doingText', () => {
   })
 
   it('says how a helper finished, from its result', () => {
-    const result = { summary: null, durationSeconds: null, filesRead: null, filesWritten: null, at: 1 }
+    const result = { summary: null, durationSeconds: null, filesRead: null, filesWritten: null, inputTokens: null, outputTokens: null, reasoningTokens: null, apiCalls: null, costUsd: null, at: 1 }
 
     expect(doingText(agent({ phase: 'finished', result: { ...result, status: 'completed' } }))).toBe('finished')
     expect(doingText(agent({ phase: 'finished', result: { ...result, status: 'timeout' } }))).toBe('timed out')
@@ -155,17 +159,17 @@ describe('tagFacts', () => {
 
 describe('countsOf', () => {
   it('counts what is under way, leaving out what is not', () => {
-    expect(countsOf({ working: 2, waiting: 1, idle: 3, helpers: 1 })).toEqual([
+    expect(countsOf({ working: 2, waiting: 1, idle: 3, helpers: 1, automations: 0, elsewhere: 0 })).toEqual([
       { id: 'working', text: '2 working' },
       { id: 'waiting', text: '1 waiting for you' },
       { id: 'idle', text: '3 idle' },
       { id: 'helpers', text: '1 helper' }
     ])
-    expect(countsOf({ working: 0, waiting: 0, idle: 4, helpers: 2 })).toEqual([
+    expect(countsOf({ working: 0, waiting: 0, idle: 4, helpers: 2, automations: 0, elsewhere: 0 })).toEqual([
       { id: 'idle', text: '4 idle' },
       { id: 'helpers', text: '2 helpers' }
     ])
-    expect(countsOf({ working: 0, waiting: 0, idle: 0, helpers: 0 })).toEqual([])
+    expect(countsOf({ working: 0, waiting: 0, idle: 0, helpers: 0, automations: 0, elsewhere: 0 })).toEqual([])
   })
 })
 
@@ -177,6 +181,7 @@ describe('capsNotice', () => {
   it('names what this Hermes cannot list yet', () => {
     expect(capsNotice({ ...ALL_CAPS, delegation: false })).toBe('This Hermes cannot list its helpers yet: update Hermes')
     expect(capsNotice({ ...ALL_CAPS, activeList: false, delegation: false, config: false })).toBe('This Hermes cannot list its running sessions, its helpers or its settings yet: update Hermes')
+    expect(capsNotice({ ...ALL_CAPS, automations: false, sessionsDb: false })).toBe('This Hermes cannot list its automations or its sessions outside Herald yet: update Hermes')
   })
 })
 
@@ -196,5 +201,33 @@ describe('roomNotices', () => {
 
   it('does not call an unknown tool progress off', () => {
     expect(roomNotices({ connected: true, state: { toolProgress: null, caps: ALL_CAPS }, pets: 1 })).toEqual([])
+  })
+})
+
+describe('work outside Herald', () => {
+  const waiting = agent({ id: 'e:tg1', kind: 'elsewhere', phase: 'waiting', step: 'waiting for your OK in Telegram', elsewhere: { where: 'Telegram', active: true, lastActiveAt: 1, approval: true, liveAt: 1 } })
+
+  it('names a helper outside Herald that has no title', () => {
+    expect(agentTitle(agent({ kind: 'elsewhere', parentId: 'e:tg1' }))).toBe('A helper outside Herald')
+    expect(agentTitle(agent({ kind: 'elsewhere' }))).toBe('A Hermes session')
+    expect(agentTitle(agent({ kind: 'helper', parentId: 's:1' }))).toBe('A helper')
+  })
+
+  it('says where an approval waits, and leaves it off the tag its sign already says', () => {
+    const facts: RoomFact[] = [
+      { kind: 'waiting', text: 'waiting for your OK in Telegram', trace: null },
+      { kind: 'activity', text: 'Telegram · active now', trace: null }
+    ]
+
+    expect(doingText(waiting)).toBe('waiting for your OK in Telegram')
+    expect(doingText({ ...waiting, step: null })).toBe('waiting for your OK in Telegram')
+    expect(tagFacts(waiting, facts, null).map(fact => fact.text)).toEqual(['Telegram · active now'])
+  })
+
+  it('says the lane is coarse, or that it shows live steps while live detail is on', () => {
+    expect(laneWords(false)).toEqual({ note: 'Coarse: titles and activity, read once a minute', about: "Hermes work outside Herald, from Hermes's session list: titles and whether each is active, read once a minute. The room shows no steps for it." })
+    expect(laneWords(true).note).toBe('Live steps from Hermes in each app')
+    expect(laneWords(true).about).toContain('by name only')
+    expect(laneWords(true).about).toContain('Approvals there are answered there.')
   })
 })
