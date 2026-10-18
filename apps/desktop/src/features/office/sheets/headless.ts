@@ -18,6 +18,7 @@ import { UniverDocsPlugin } from '@univerjs/docs'
 import { UniverDrawingPlugin } from '@univerjs/drawing'
 import { UniverFormulaEnginePlugin } from '@univerjs/engine-formula'
 import { IRenderManagerService } from '@univerjs/engine-render'
+import { DragManagerService, HoverManagerService } from '@univerjs/sheets-ui'
 import { UniverSheetsPlugin } from '@univerjs/sheets'
 import type { FWorkbook } from '@univerjs/sheets/facade'
 import { UniverSheetsConditionalFormattingPlugin } from '@univerjs/sheets-conditional-formatting'
@@ -89,6 +90,19 @@ export async function withHeadlessSheets<T>(snapshot: WorkbookSnapshot, work: (s
 
     if (!injector.has(IRenderManagerService)) {
       injector.add([IRenderManagerService, { useValue: { created$: NEVER } as unknown as IRenderManagerService }])
+    }
+
+    // The Sheets UI facade (imported once a window shows a workbook) also reaches for its hover and
+    // drag managers when an instance reaches Rendered (sheets-ui/facade registers its click and
+    // hover listeners there). A headless instance registers no UI plugin, so neither exists; stand
+    // them in so it registers its listeners instead of throwing. No renderer is ever created here,
+    // so the listeners never fire.
+    if (!injector.has(HoverManagerService)) {
+      injector.add([HoverManagerService, { useValue: {} as unknown as HoverManagerService }])
+    }
+
+    if (!injector.has(DragManagerService)) {
+      injector.add([DragManagerService, { useValue: {} as unknown as DragManagerService }])
     }
 
     trackChartRanges(univer)

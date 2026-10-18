@@ -576,20 +576,27 @@ def test_omarchy_install_never_overwrites_the_persons_files(tmp_path, monkeypatc
 
 
 class FakeHermes:
-    """`hermes` as setup sees it: replies by command, and a config that `config set` changes."""
+    """`hermes` as setup sees it: replies by command, and a config whose keys `config set` tracks
+    (only `tools.tool_search.enabled` is mirrored in `tool_search`, which the tests read)."""
 
     def __init__(self, replies: dict[str, tuple[int, str]] | None = None, tool_search: str = "auto"):
         self.replies = replies or {}
         self.tool_search = tool_search
+        self.config: dict[str, str] = {}
         self.ran: list[list[str]] = []
 
     def __call__(self, argv, **kwargs):
         args = argv[1:]
         self.ran.append(args)
         if args[:2] == ["config", "get"]:
-            return subprocess.CompletedProcess(argv, 0, f"{self.tool_search}\n", "")
+            key = args[2]
+            value = self.tool_search if key == cli.TOOL_SEARCH else self.config.get(key, "")
+            return subprocess.CompletedProcess(argv, 0, f"{value}\n", "")
         if args[:2] == ["config", "set"]:
-            self.tool_search = args[3]
+            key, value = args[2], args[3]
+            self.config[key] = value
+            if key == cli.TOOL_SEARCH:
+                self.tool_search = value
         code, out = self.replies.get(" ".join(args), (0, "✓ done"))
         return subprocess.CompletedProcess(argv, code, out, "")
 
@@ -620,6 +627,8 @@ def test_setup_links_the_bridge_enables_it_and_says_what_changed(hermes_setup, c
     assert link.is_symlink() and link.resolve() == bridge.resolve()
     assert ["plugins", "enable", "herald-os-bridge"] in hermes.ran and ["tools", "enable", "herald_os"] in hermes.ran
     assert ["config", "set", "tools.tool_search.enabled", "off"] in hermes.ran
+    # The shared browser (herald-os-browser) is pointed at from setup: headed, on the CDP port.
+    assert ["config", "set", "browser.headed", "true"] in hermes.ran and ["config", "set", "browser.cdp_url", cli.BROWSER_CDP_URL] in hermes.ran
     assert (hermes_home / "herald-os" / "tool-search-before").read_text() == "auto\n"
     out = capsys.readouterr().out
     assert "plugins.enabled" in out and "platform_toolsets.cli" in out and "it was auto" in out and "setup --undo" in out
@@ -652,7 +661,14 @@ def test_setup_undo_takes_back_every_change(hermes_setup, capsys):
 
     assert cli.setup(["--undo"]) == 0
 
-    assert hermes.ran[-4:] == [["tools", "disable", "herald_os"], ["plugins", "disable", "herald-os-bridge"], ["config", "get", "tools.tool_search.enabled"], ["config", "set", "tools.tool_search.enabled", "on"]]
+    assert hermes.ran[-6:] == [
+        ["tools", "disable", "herald_os"],
+        ["plugins", "disable", "herald-os-bridge"],
+        ["config", "set", "browser.cdp_url", ""],
+        ["config", "set", "browser.headed", "false"],
+        ["config", "get", "tools.tool_search.enabled"],
+        ["config", "set", "tools.tool_search.enabled", "on"],
+    ]
     assert not (hermes_home / "plugins" / "herald-os-bridge").exists()
     assert not (hermes_home / "herald-os" / "tool-search-before").exists()
     # The app's first start must not turn it all back on.

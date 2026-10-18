@@ -77,7 +77,11 @@ describe('readOmarchyTheme', () => {
     expect(readOmarchyTheme(home)?.spec.name).toBe('omarchy-rose-pine')
     expect(readOmarchyTheme(home)?.spec.colors.accent).toBe('#c4a7e7')
     expect(isOmarchy(home, {})).toBe(true)
-    expect(isOmarchy(path.join(home, 'nobody'), {})).toBe(false)
+    // isOmarchy also detects a system-wide Omarchy (the /usr/share/omarchy fallback), so a bogus
+    // home still reads as Omarchy on an Omarchy host — assert the negative only where there is none.
+    if (!fs.existsSync('/usr/share/omarchy/themes')) {
+      expect(isOmarchy(path.join(home, 'nobody'), {})).toBe(false)
+    }
     fs.rmSync(home, { recursive: true, force: true })
   })
 })

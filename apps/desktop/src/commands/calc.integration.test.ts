@@ -4,6 +4,10 @@ import { matchIntent } from '../lib/voice/intents.ts'
 import { type CommandContext, defineCommands, resetCommands, runCommand } from '../store/os-commands.ts'
 import { calcCommands } from './calc.ts'
 
+// Herald Calc reads dates in the person's zone (the machine's); pin it so the same day counts are
+// expected on a UTC CI machine and an Eastern one.
+process.env.TZ = 'UTC'
+
 // The calc commands with Herald Calc's real engine, graph helpers, vocabulary and places; only the
 // preload bridge (the rates, the history) and the window are stand-ins.
 const edges = vi.hoisted(() => {
